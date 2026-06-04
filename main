@@ -1,0 +1,642 @@
+import subprocess, sys 
+ 
+REQUIRED = ["ultralytics", "cv2", "numpy", "matplotlib", 
+"requests"] 
+PKG_MAP  = {"cv2": "opencv-python"} 
+ 
+for pkg in REQUIRED: 
+    try: 
+        __import__(pkg) 
+    except ImportError: 
+        install_name = PKG_MAP.get(pkg, pkg) 
+        print(f"[SETUP] Installing {install_name} …") 
+        subprocess.check_call([sys.executable, "-m", "pip", 
+"install", 
+                               install_name, "-q"]) 
+ 
+import os, time, math, warnings 
+import cv2 
+import numpy as np 
+import matplotlib 
+matplotlib.use("Agg") 
+import matplotlib.pyplot as plt 
+from collections import deque, defaultdict 
+from ultralytics import YOLO 
+warnings.filterwarnings("ignore") 
+ 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+#  CONFIG 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+VIDEO_PATH   = "videoplayback.mp4" 
+MODEL_PATH   = "yolov8n.pt" 
+REPORT_PATH  = "traffic_report.png" 
+ 
+CONFIDENCE   = 0.35 
+FRAME_SKIP   = 2 
+SMOOTH_WIN   = 12 
+TRAIL_LEN    = 35 
+ 
+GREEN_LOW    = 10 
+GREEN_MED    = 22 
+GREEN_HIGH   = 38 
+GREEN_AMB    = 50 
+YELLOW_DUR   = 3 
+RED_DUR      = 20 
+ 
+LOW_THRESH   = 5 
+HIGH_THRESH  = 10 
+ 
+# ── FIX 2: Tuned ambulance heuristic 
+────────────────────────────── 
+# Raised from 0.52 → 0.40 so that whitish vehicles are caught 
+earlier 
+# Also expanded HSV range to catch off-white/cream ambulance 
+colors 
+WHITE_RATIO  = 0.40 
+ 
+VEHICLE_CLS  = {"car", "motorcycle", "bus", "truck", "ambulance"} 
+AMBULANCE_CLS= {"ambulance"} 
+ 
+PANEL_W      = 350   # slightly wider panel to fit total count 
+text 
+ 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+#  TRAFFIC SIGNAL STATE MACHINE 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+class TrafficSignal: 
+    def __init__(self): 
+        self.state          = "RED" 
+        self.state_start    = time.time() 
+        self.green_dur      = GREEN_LOW 
+        self.ambulance_mode = False 
+        self.log            = [] 
+        self._session_start = time.time() 
+ 
+    def update(self, smoothed_count: float, ambulance: bool): 
+        now     = time.time() 
+        elapsed = now - self.state_start 
+ 
+        if ambulance and self.state != "GREEN": 
+            self.state          = "GREEN" 
+            self.state_start    = now 
+            self.green_dur      = GREEN_AMB 
+            self.ambulance_mode = True 
+            self._log(now, "AMBULANCE OVERRIDE -> GREEN 50s") 
+            return 
+ 
+        if self.state == "GREEN": 
+            if elapsed >= self.green_dur: 
+                self.state       = "YELLOW" 
+                self.state_start = now 
+                self._log(now, f"GREEN({self.green_dur}s) -> 
+YELLOW") 
+ 
+        elif self.state == "YELLOW": 
+            if elapsed >= YELLOW_DUR: 
+                self.state          = "RED" 
+                self.state_start    = now 
+                self.ambulance_mode = False 
+                self._log(now, "YELLOW -> RED") 
+ 
+        elif self.state == "RED": 
+            if elapsed >= RED_DUR: 
+                self.green_dur   = 
+self._calc_green(smoothed_count) 
+                self.state       = "GREEN" 
+                self.state_start = now 
+                density          = 
+self._density_label(smoothed_count) 
+                self._log(now, f"RED -> GREEN [{density}] 
+{self.green_dur}s") 
+ 
+    def _calc_green(self, count: float) -> int: 
+        if count >= HIGH_THRESH:  return GREEN_HIGH 
+        if count >= LOW_THRESH:   return GREEN_MED 
+        return GREEN_LOW 
+ 
+    def _density_label(self, count: float) -> str: 
+        if count >= HIGH_THRESH:  return "HIGH" 
+        if count >= LOW_THRESH:   return "MEDIUM" 
+        return "LOW" 
+ 
+    def remaining(self) -> float: 
+        e   = time.time() - self.state_start 
+        dur = {"GREEN": self.green_dur, "YELLOW": YELLOW_DUR, 
+"RED": RED_DUR} 
+        return max(0.0, dur[self.state] - e) 
+ 
+    def _log(self, ts, msg): 
+        self.log.append((ts - self._session_start, msg)) 
+        print(f"  [SIGNAL {ts - self._session_start:6.1f}s] 
+{msg}") 
+ 
+    @property 
+    def bgr(self): 
+        return {"GREEN": (0,210,60), "YELLOW":(0,190,255), 
+"RED":(0,30,220)}[self.state] 
+ 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+#  FIX 2: IMPROVED AMBULANCE DETECTION 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+def is_ambulance(frame, x1, y1, x2, y2, label: str) -> bool: 
+    """ 
+    Three-layer ambulance check: 
+      1. Model label is literally 'ambulance'  → immediate True 
+      2. Large white/light-coloured vehicle (bus or truck ROI 
+check) 
+      3. Aspect ratio + size guard to avoid false positives on 
+cars 
+    """ 
+    # Layer 1 — model already says ambulance 
+    if label in AMBULANCE_CLS: 
+        return True 
+ 
+    # Only apply heuristic to bus/truck (ambulances are large) 
+    if label not in ("bus", "truck"): 
+        return False 
+ 
+    # Layer 2 — colour heuristic on the ROI 
+    roi = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] 
+    if roi.size == 0: 
+        return False 
+ 
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV) 
+ 
+    # Broader white/cream range — catches off-white ambulances 
+    white_mask = cv2.inRange(hsv, (0, 0, 170), (180, 60, 255)) 
+    white_frac = np.count_nonzero(white_mask) / white_mask.size 
+ 
+    if white_frac < WHITE_RATIO: 
+        return False 
+ 
+    # Layer 3 — red/blue siren light check anywhere in ROI 
+    # (real ambulances almost always have coloured beacon pixels) 
+    red_mask  = cv2.inRange(hsv, (0,  120, 120), (10,  255, 255)) 
+    blue_mask = cv2.inRange(hsv, (100, 80, 100), (130, 255, 255)) 
+    siren_frac = (np.count_nonzero(red_mask) + 
+                  np.count_nonzero(blue_mask)) / white_mask.size 
+ 
+    # Accept if white AND has any siren pixels, OR if very 
+heavily white 
+    return siren_frac > 0.005 or white_frac > 0.65 
+ 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+#  DRAWING HELPERS 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+def draw_box(frame, x1, y1, x2, y2, label, conf, is_amb, 
+sig_col): 
+    col       = (0, 40, 255) if is_amb else sig_col 
+    thickness = 3 if is_amb else 2 
+    cv2.rectangle(frame, (x1, y1), (x2, y2), col, thickness) 
+    tag = (f"AMBULANCE {conf:.2f}" if is_amb else f"{label} 
+{conf:.2f}") 
+    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 
+0.52, 1) 
+    cv2.rectangle(frame, (x1, y1-th-6), (x1+tw+4, y1), col, -1) 
+    cv2.putText(frame, tag, (x1+2, y1-4), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255,255,255), 1, 
+cv2.LINE_AA) 
+ 
+def draw_trails(frame, history, panel_w): 
+    for pts in history.values(): 
+        n = len(pts) 
+        for i in range(1, n): 
+            if pts[i][0] > frame.shape[1] - panel_w: 
+                continue 
+            a = i / n 
+            c = (int(40*a), int(160*a), int(255*a)) 
+            cv2.line(frame, pts[i-1], pts[i], c, 1) 
+ 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+#  PANEL — FIX 1: TOTAL VEHICLE COUNT ADDED 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+def draw_signal_panel(canvas, signal, raw_count, smoothed, 
+                      amb_detected, total_vehicles):   # <-- NEW 
+param 
+    h, w  = canvas.shape[:2] 
+    px    = w - PANEL_W 
+    rem   = signal.remaining() 
+    now_t = time.time() 
+ 
+    ov = canvas.copy() 
+    cv2.rectangle(ov, (px, 0), (w, h), (12, 14, 22), -1) 
+    cv2.addWeighted(ov, 0.85, canvas, 0.15, 0, canvas) 
+    cv2.line(canvas, (px, 0), (px, h), (50, 55, 70), 2) 
+ 
+    # ── Traffic Light 
+────────────────────────────────────────────── 
+    cx = px + PANEL_W // 2 
+    housing_top, housing_bot = 18, 238 
+    cv2.rectangle(canvas, (cx-38, housing_top), (cx+38, 
+housing_bot), 
+                  (28, 30, 38), -1) 
+    cv2.rectangle(canvas, (cx-38, housing_top), (cx+38, 
+housing_bot), 
+                  (60, 65, 80), 1) 
+ 
+    LIGHTS = [("RED",    (0, 30, 200),  (25, 40, 180)), 
+              ("YELLOW", (0,140, 200),  (20, 80, 100)), 
+              ("GREEN",  (0,180,  50),  (15, 90,  30))] 
+    for i, (phase, on_col, off_col) in enumerate(LIGHTS): 
+        cy  = housing_top + 38 + i * 72 
+        col = on_col if signal.state == phase else off_col 
+        cv2.circle(canvas, (cx, cy), 28, (18,18,26), -1) 
+        cv2.circle(canvas, (cx, cy), 24, col, -1) 
+        if signal.state == phase: 
+            pulse = int(abs(math.sin(now_t * 2)) * 18) 
+            cv2.circle(canvas, (cx, cy), 26 + pulse//4, col, 1) 
+ 
+    def txt(s, y, size=0.60, col=(190,190,190), thick=1): 
+        cv2.putText(canvas, s, (px+14, y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, size, col, thick, 
+cv2.LINE_AA) 
+ 
+    ty = housing_bot + 22 
+ 
+    txt(f"STATE  : {signal.state}", ty,    0.72, signal.bgr, 2) 
+    txt(f"TIMER  : {rem:.1f} s",    ty+32, 0.65) 
+    txt(f"GREEN  : {signal.green_dur} s",  ty+58, 0.62, 
+(70,210,80)) 
+ 
+    cv2.line(canvas, (px+10, ty+75), (w-10, ty+75), (50,55,70), 
+1) 
+ 
+    # ── FIX 1: Vehicle counts 
+────────────────────────────────────── 
+    txt(f"In frame (raw)  : {raw_count}",      ty+95,  0.55) 
+    txt(f"In frame (avg)  : {smoothed:.1f}",   ty+116, 0.55) 
+ 
+    # ── TOTAL VEHICLE COUNT — highlighted box 
+───────────────────── 
+    tv_y = ty + 130 
+    cv2.rectangle(canvas, (px+10, tv_y), (w-10, tv_y+34), (30, 
+50, 30), -1) 
+    cv2.rectangle(canvas, (px+10, tv_y), (w-10, tv_y+34), (0, 
+180, 60), 1) 
+    cv2.putText(canvas, 
+                f"  TOTAL VEHICLES : {total_vehicles}", 
+                (px+14, tv_y+23), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, 
+                (0, 230, 80), 2, cv2.LINE_AA) 
+ 
+    # ── Density badge 
+────────────────────────────────────────────── 
+    density = ("HIGH"   if smoothed >= HIGH_THRESH else 
+               "MEDIUM" if smoothed >= LOW_THRESH  else "LOW") 
+    d_col   = 
+{"LOW":(0,200,80),"MEDIUM":(0,165,255),"HIGH":(0,30,220)}[dens
+ity] 
+    cv2.rectangle(canvas, (px+10, tv_y+42), (w-10, tv_y+68), 
+d_col, -1) 
+    cv2.putText(canvas, f"  DENSITY : {density}", 
+                (px+14, tv_y+62), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255,255,255), 2, 
+cv2.LINE_AA) 
+ 
+    exp = {"LOW":    f"LOW < {LOW_THRESH} -> {GREEN_LOW}s green", 
+           "MEDIUM": f"MED {LOW_THRESH}-{HIGH_THRESH} -> 
+{GREEN_MED}s green", 
+           "HIGH":   f"HIGH >= {HIGH_THRESH} -> {GREEN_HIGH}s 
+green"}[density] 
+    txt(exp, tv_y+86, 0.45, (140,140,140)) 
+ 
+    # ── Ambulance alert 
+──────────────────────────────────────────── 
+    if amb_detected or signal.ambulance_mode: 
+        ay    = tv_y + 100 
+        pulse = int(abs(math.sin(now_t * 5)) * 80) 
+        cv2.rectangle(canvas, (px+10, ay), (w-10, ay+42), 
+                      (0, 0, 100+pulse), -1) 
+        cv2.putText(canvas, "  AMBULANCE PRIORITY", 
+                    (px+14, ay+28), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, 
+                    (100, 210, 255), 2, cv2.LINE_AA) 
+ 
+    # ── Mini bar chart 
+───────────────────────────────────────────── 
+    cv2.line(canvas, (px+10, h-110), (w-10, h-110), (50,55,70), 
+1) 
+    txt("Vehicle History", h-96, 0.50, (130,130,150)) 
+    bar_area_h = 60 
+    bar_y_bot  = h - 18 
+    bar_area_w = PANEL_W - 28 
+    bw         = bar_area_w // 20 
+ 
+    for i, cnt in enumerate(_count_history): 
+        bh  = int(min(cnt, 15) / 15 * bar_area_h) 
+        bx  = px + 14 + i * bw 
+        col = (0,200,80) if cnt < LOW_THRESH else (0,165,255) if 
+cnt < HIGH_THRESH else (0,30,220) 
+        cv2.rectangle(canvas, (bx, bar_y_bot-bh), (bx+bw-2, 
+bar_y_bot), col, -1) 
+ 
+def draw_hud(canvas, fps, fi, paused): 
+    status = "PAUSED" if paused else f"FPS {fps:4.1f}" 
+    cv2.putText(canvas, f"{status}   Frame {fi}", 
+                (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 
+                0.65, (180,180,180), 1, cv2.LINE_AA) 
+ 
+def draw_state_bar(canvas, signal, frame_w, frame_h): 
+    s  = f"  {signal.state}  " 
+    sc = 1.3 
+    ft = cv2.FONT_HERSHEY_SIMPLEX 
+    (sw, sh), _ = cv2.getTextSize(s, ft, sc, 3) 
+    sx  = (frame_w - sw) // 2 
+    sy  = frame_h - 18 
+    ov  = canvas.copy() 
+    cv2.rectangle(ov, (sx-12, frame_h-sh-24), (sx+sw+12, 
+frame_h), 
+                  signal.bgr, -1) 
+    cv2.addWeighted(ov, 0.70, canvas, 0.30, 0, canvas) 
+    cv2.putText(canvas, s, (sx, sy), ft, sc, (255,255,255), 3, 
+cv2.LINE_AA) 
+ 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+#  REPORT 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+def save_report(time_data, count_data, density_data, signal_log, 
+total_vehicles): 
+    if len(time_data) < 2: 
+        print("[REPORT] Not enough data.") 
+        return 
+ 
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9), 
+facecolor="#0e1117") 
+    fig.suptitle( 
+        f"Intelligent Traffic Management — Session Report  |  " 
+        f"Total Unique Vehicles: {total_vehicles}", 
+        fontsize=14, color="white", y=0.98) 
+ 
+    for ax in axes: 
+        ax.set_facecolor("#1a1d26") 
+        ax.tick_params(colors="#aaa") 
+        ax.spines[:].set_color("#333") 
+        ax.xaxis.label.set_color("#aaa") 
+        ax.yaxis.label.set_color("#aaa") 
+ 
+    t = np.array(time_data) 
+    c = np.array(count_data) 
+ 
+    axes[0].fill_between(t, c, alpha=0.3, color="#4a9eff") 
+    axes[0].plot(t, c, color="#4a9eff", lw=1.2, label="Raw 
+count") 
+    if len(c) >= SMOOTH_WIN: 
+        sm = np.convolve(c, np.ones(SMOOTH_WIN)/SMOOTH_WIN, 
+mode="same") 
+        axes[0].plot(t, sm, color="#ffaa00", lw=2, ls="--", 
+                     label=f"Smoothed (w={SMOOTH_WIN})") 
+    axes[0].axhline(LOW_THRESH,  color="#00e060", ls=":", lw=1, 
+                    label=f"LOW->MED ({LOW_THRESH})") 
+    axes[0].axhline(HIGH_THRESH, color="#ff3030", ls=":", lw=1, 
+                    label=f"MED->HIGH ({HIGH_THRESH})") 
+    axes[0].set_ylabel("Vehicle Count") 
+    axes[0].legend(loc="upper right", facecolor="#1a1d26", 
+                   labelcolor="white", fontsize=8) 
+    axes[0].grid(True, alpha=0.15) 
+ 
+    d_num = [{"LOW":0,"MEDIUM":1,"HIGH":2}[d] for d in 
+density_data] 
+    cmap  = matplotlib.colormaps["RdYlGn_r"].resampled(3) 
+    axes[1].scatter(t, d_num, c=d_num, cmap=cmap, vmin=0, vmax=2, 
+                    s=8, alpha=0.8) 
+    axes[1].set_yticks([0,1,2]) 
+    axes[1].set_yticklabels(["LOW","MEDIUM","HIGH"], 
+color="#aaa") 
+    axes[1].set_ylabel("Traffic Density") 
+    axes[1].grid(True, alpha=0.15) 
+ 
+    colours = 
+{"GREEN":"#00e060","YELLOW":"#ffcc00","RED":"#ff2020"} 
+    if signal_log: 
+        for ts, msg in signal_log: 
+            for phase, col in colours.items(): 
+                if phase in msg: 
+                    axes[2].axvline(ts, color=col, lw=1.5, 
+alpha=0.7) 
+                    axes[2].text(ts, 0.5, msg[:30], rotation=70, 
+                                 fontsize=5.5, color=col, 
+                                 va="bottom", ha="left") 
+    axes[2].set_xlim(t[0], t[-1]) 
+    axes[2].set_ylim(0, 1) 
+    axes[2].set_ylabel("Signal Events") 
+    axes[2].set_xlabel("Time (seconds)") 
+    axes[2].yaxis.set_visible(False) 
+ 
+    plt.tight_layout(rect=[0,0,1,0.97]) 
+    plt.savefig(REPORT_PATH, dpi=150, bbox_inches="tight", 
+                facecolor=fig.get_facecolor()) 
+    plt.close(fig) 
+    print(f"[REPORT] Saved -> {REPORT_PATH}") 
+ 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+#  GLOBAL 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+_count_history = deque(maxlen=20) 
+ 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+#  MAIN 
+# 
+══════════════════════════════════════════════════════════════
+════ 
+def main(): 
+    if not os.path.exists(VIDEO_PATH): 
+        print(f"[ERROR] '{VIDEO_PATH}' not found. Place your 
+video file here.") 
+        sys.exit(1) 
+ 
+    print(f"[MODEL] Loading {MODEL_PATH} …") 
+    model = YOLO(MODEL_PATH) 
+    print("[MODEL] Ready") 
+ 
+    cap = cv2.VideoCapture(VIDEO_PATH) 
+    if not cap.isOpened(): 
+        print(f"[ERROR] Cannot open {VIDEO_PATH}") 
+        sys.exit(1) 
+ 
+    fw    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) 
+    fh    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) 
+    fps_v = cap.get(cv2.CAP_PROP_FPS) or 30 
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) 
+    print(f"[VIDEO] {fw}x{fh} @ {fps_v:.1f} FPS | {total} 
+frames") 
+ 
+    signal        = TrafficSignal() 
+    recent_counts = deque(maxlen=SMOOTH_WIN) 
+    track_history = defaultdict(list) 
+    time_data, count_data, density_data = [], [], [] 
+ 
+    # FIX 1: track all unique IDs seen across the entire session 
+    all_seen_ids   = set() 
+    total_vehicles = 0 
+ 
+    frame_idx    = 0 
+    prev_tick    = time.time() 
+    paused       = False 
+    session_t0   = time.time() 
+    screenshot_n = 0 
+ 
+    print("\n[CONTROLS]  ESC=quit  A=ambulance  P=pause  S=screen
+shot\n") 
+ 
+    while True: 
+        if not paused: 
+            ret, frame = cap.read() 
+            if not ret: 
+                print("[VIDEO] End of video.") 
+                break 
+            frame_idx += 1 
+            if frame_idx % FRAME_SKIP != 0: 
+                continue 
+ 
+        results = model.track( 
+            frame, 
+            persist=True, 
+            conf=CONFIDENCE, 
+            tracker="bytetrack.yaml", 
+            verbose=False, 
+        ) 
+ 
+        vehicle_count      = 0 
+        ambulance_detected = False 
+        active_ids         = set() 
+ 
+        for r in results: 
+            if r.boxes is None: 
+                continue 
+            for box in r.boxes: 
+                cls_id = int(box.cls[0]) 
+                label  = model.names[cls_id] 
+                conf   = float(box.conf[0]) 
+                if conf < CONFIDENCE: 
+                    continue 
+                if label not in VEHICLE_CLS: 
+                    continue 
+ 
+                x1, y1, x2, y2 = map(int, box.xyxy[0]) 
+ 
+                # FIX 2: use improved ambulance detector 
+                is_amb = is_ambulance(frame, x1, y1, x2, y2, 
+label) 
+                if is_amb: 
+                    ambulance_detected = True 
+ 
+                vehicle_count += 1 
+ 
+                tid = int(box.id[0]) if box.id is not None else 
+1 
+                active_ids.add(tid) 
+ 
+                # FIX 1: accumulate unique vehicle IDs 
+                if tid != -1 and tid not in all_seen_ids: 
+                    all_seen_ids.add(tid) 
+                    total_vehicles += 1 
+ 
+                cx, cy = (x1+x2)//2, (y1+y2)//2 
+                track_history[tid].append((cx, cy)) 
+                if len(track_history[tid]) > TRAIL_LEN: 
+                    track_history[tid].pop(0) 
+ 
+                draw_box(frame, x1, y1, x2, y2, label, conf, 
+                         is_amb, signal.bgr) 
+ 
+        for tid in list(track_history.keys()): 
+            if tid not in active_ids: 
+                del track_history[tid] 
+ 
+        recent_counts.append(vehicle_count) 
+        _count_history.append(vehicle_count) 
+        smoothed = float(np.mean(recent_counts)) 
+        signal.update(smoothed, ambulance_detected) 
+ 
+        elapsed = time.time() - session_t0 
+        time_data.append(elapsed) 
+        count_data.append(vehicle_count) 
+        density_data.append("HIGH" if smoothed>=HIGH_THRESH else 
+                            "MEDIUM" if smoothed>=LOW_THRESH else 
+"LOW") 
+ 
+        panel  = np.zeros((fh, PANEL_W, 3), dtype=np.uint8) 
+        canvas = np.hstack([frame, panel]) 
+ 
+        draw_trails(canvas, track_history, PANEL_W) 
+        draw_signal_panel(canvas, signal, vehicle_count, 
+smoothed, 
+                          ambulance_detected, total_vehicles)   # 
+FIX 1 
+        draw_state_bar(canvas, signal, fw, fh) 
+ 
+        now      = time.time() 
+        disp_fps = 1.0 / max(now - prev_tick, 1e-6) 
+        prev_tick = now 
+        draw_hud(canvas, disp_fps, frame_idx, paused) 
+ 
+        cv2.imshow("Intelligent Traffic Management System", 
+canvas) 
+ 
+        key = cv2.waitKey(1) & 0xFF 
+        if key == 27: 
+            print("[SYS] User quit.") 
+            break 
+        elif key in (ord('a'), ord('A')): 
+            ambulance_detected = True 
+            signal.update(smoothed, True) 
+            print("[MANUAL] Ambulance triggered via key A") 
+        elif key in (ord('p'), ord('P')): 
+            paused = not paused 
+            print("[SYS] " + ("Paused" if paused else "Resumed")) 
+        elif key in (ord('s'), ord('S')): 
+            fn = f"screenshot_{screenshot_n:03d}.png" 
+            cv2.imwrite(fn, canvas) 
+            print(f"[SYS] Screenshot -> {fn}") 
+            screenshot_n += 1 
+ 
+    cap.release() 
+    cv2.destroyAllWindows() 
+ 
+    print(f"\n[RESULT] Total unique vehicles counted: 
+{total_vehicles}") 
+    print("[REPORT] Generating session report …") 
+    save_report(time_data, count_data, density_data, signal.log, 
+total_vehicles) 
+ 
+    print("\n── Signal Event Log 
+──────────────────────────────────────") 
+    for ts, msg in signal.log: 
+        print(f"  [{ts:7.1f}s]  {msg}") 
+    print("──────────────────────────────────────────────────────
+────") 
+    print(f"[DONE] Report -> {REPORT_PATH}") 
+    print(f"[DONE] Total unique vehicles seen: {total_vehicles}") 
+ 
+if __name__ == "__main__": 
+    main()
